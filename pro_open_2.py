@@ -58,7 +58,7 @@ input int CloseTimeMinLevel1 = 16; // 16th minute => close for 45–69 trades
 input int CloseTimeMinLevel2 = 31; // 31st minute => close for 70+ trades
 
 // Bet sizing
-input double BetSizingFactor = 800.0;  // AccountBalance / BetSizingFactor => lot size
+input double BetSizingFactor = 30000.0;  // Adjusted for realistic lot sizes
 input double MinTradeSize    = 0.1;    // Min lot
 input int    SlippagePoints  = 3;      // Slippage in points
 input string TradeComment    = "DAX30Strategy";
@@ -117,6 +117,9 @@ bool session2Allowed   = true;
 // Global var prefix for storing adjusted bid/ask/spread
 string globalVarPrefix;
 
+// Magic number for trades
+input int MagicNumber = 30001;  // Set externally per chart
+
 // ---------------------------------------------------------------------------
 //                           MODULE 2: TIME MANAGEMENT
 // ---------------------------------------------------------------------------
@@ -166,8 +169,12 @@ datetime GetUKTime()
 // Convert "HH:MM" => total minutes
 int StrToTimeMins(string timeStr)
 {
-   int h = StringToInteger(StringSubstr(timeStr,0,2));
-   int m = StringToInteger(StringSubstr(timeStr,3,2));
+   // Parse HH and MM manually using character codes to avoid the
+   // long-to-int conversion warnings triggered by StringToInteger().
+   int h = ((int)StringGetChar(timeStr, 0) - '0') * 10
+           + ((int)StringGetChar(timeStr, 1) - '0');
+   int m = ((int)StringGetChar(timeStr, 3) - '0') * 10
+           + ((int)StringGetChar(timeStr, 4) - '0');
    return (h * 60) + m;
 }
 
@@ -223,35 +230,24 @@ string SanitizeSymbol(string symbol)
 }
 
 // Adjust BID/ASK by dynamic or forced spread => global vars
-void AdjustPricesBySpread()
+bool AdjustPricesBySpread()
 {
-    if(!UseDebugDiagnostics) return;
-
-    Print("[DBG] AdjustPricesBySpread called.");
+    double bid = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+    double ask = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
+    if(bid <= 0 || ask <= 0) return false;  // Tell caller we failed
 
     double spreadPoints = GetSpreadForTime();
-    double bid          = SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
-    double ask          = SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK);
-
-    if(bid <= 0.0 || ask <= 0.0)
-    {
-        Print("[DBG][SpreadError] Invalid bid/ask. Bid: ", DoubleToString(bid,2),
-              " Ask: ", DoubleToString(ask,2));
-        return;
-    }
-
     double adjustedBid = bid - (spreadPoints * Point);
     double adjustedAsk = ask + (spreadPoints * Point);
 
-    Print("[DBG][SpreadCalculation] RawBid=", DoubleToString(bid,2),
-          " RawAsk=", DoubleToString(ask,2),
-          " => AdjustedBid=", DoubleToString(adjustedBid,2),
-          " AdjustedAsk=", DoubleToString(adjustedAsk,2),
-          " Spread=", DoubleToString(spreadPoints,1));
+    adjustedBid = NormalizeDouble(adjustedBid, _Digits);  // Normalize
+    adjustedAsk = NormalizeDouble(adjustedAsk, _Digits);  // Normalize
 
     GlobalVariableSet(globalVarPrefix+"_AdjBid", adjustedBid);
     GlobalVariableSet(globalVarPrefix+"_AdjAsk", adjustedAsk);
     GlobalVariableSet(globalVarPrefix+"_Spread", spreadPoints);
+
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -586,7 +582,7 @@ void PlaceTrade(string type, double entryPrice, double lotSize, int sessionNum)
 
     int ticket = OrderSend(SymbolToTrade, (type == "BUY") ? OP_BUY : OP_SELL,
                            lotSize, price, SlippagePoints, stopLoss,
-                           0, TradeComment, 0, 0, clrBlue);
+                           0, TradeComment, MagicNumber, 0, clrBlue);
 
     if(ticket < 0)
     {
@@ -626,32 +622,16 @@ bool IsPriceValid(double price)
 // ---------------------------------------------------------------------------
 double CalculateLotSize()
 {
-    double equity   = AccountEquity();
-    double lot      = NormalizeDouble(equity / BetSizingFactor, 2);
-    double volStep  = SymbolInfoDouble(SymbolToTrade, SYMBOL_VOLUME_STEP);
-    if(volStep <= 0) volStep = 0.01;  // NEW guard to avoid divide-by-zero
+   double equity = AccountEquity();
+   double lotRaw = equity / BetSizingFactor;        // e.g. 10 000 / 30 000 = 0.333
+   double step   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(step <= 0) step = 0.01;
 
-    double volMax   = SymbolInfoDouble(SymbolToTrade, SYMBOL_VOLUME_MAX);
-    if(volMax <= 0) volMax = 999; // fallback
+   double lot = MathFloor(lotRaw / step) * step;    // snap to step
+   lot        = MathMax(lot, MinTradeSize);         // honour min lot
+   lot        = MathMin(lot, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX));
 
-    // Step 1: ratio of lot / volStep
-    double ratio = lot / volStep;
-    // Step 2: floor that ratio as a double (avoids precision loss warning)
-    double ratioFloored = MathFloor(ratio);
-
-    // Step 3: multiply back to volStep
-    lot = ratioFloored * volStep;   // lot is already double
-
-    // Step 4: cap at volMax
-    if(lot > volMax) lot = volMax;
-
-    if(lot < MinTradeSize)
-    {
-        Print("[LotCheck] Lot too small => ", DoubleToString(lot, 2));
-        return 0.0;
-    }
-
-    return lot;
+   return NormalizeDouble(lot, 2);
 }
 // ---------------------------------------------------------------------------
 
@@ -683,18 +663,9 @@ bool CanTrade()
 
 void CheckAndPlaceTrade(SessionData &session, double currentPrice, int sessionNum)
 {
-    Print("[CheckAndPlaceTrade] Session#", sessionNum,
-          ", currentPrice=", DoubleToString(currentPrice, 2));
-
-    if(currentPrice <= 0)
-    {
-        Print("[TradeSkip] Invalid currentPrice");
-        return;
-    }
-
-    if (!session.isInitialized) return;  // <-- New guard
-    double adjustedBid = GlobalVariableGet(globalVarPrefix + "_AdjBid");
-    if (adjustedBid <= 0) return;        // Already present
+    if(!session.isInitialized) return;  // Don’t evaluate until session reset
+    double adjustedBid = GlobalVariableGet(globalVarPrefix+"_AdjBid");
+    if(adjustedBid <= 0) return;        // Wait until spread block ran
 
     if((sessionNum == 1 && !session1Allowed) ||
        (sessionNum == 2 && !session2Allowed))
@@ -1086,23 +1057,12 @@ void OnDeinit(const int reason)
 
 void OnTick()
 {
-    if(UseDebugDiagnostics)
-    {
-        datetime brokerTime = TimeCurrent();
-        string localTime    = TimeToString(TimeLocal(), TIME_DATE|TIME_SECONDS);
-        PrintFormat("[OnTickDiagnostics] BrokerTime=%s | PC_LocalTime=%s | Symbol=%s",
-                    TimeToString(brokerTime, TIME_DATE|TIME_SECONDS),
-                    localTime,
-                    SymbolToTrade);
-    }
+    if(!AdjustPricesBySpread()) return;  // Bail on very first 0-price tick
 
     // 1) Session init
     CheckSessionInitialization();
 
-    // 2) Spread & Price Adjust
-    AdjustPricesBySpread();
-
-    // 3) Sweeps & Volatility
+    // 2) Sweeps & Volatility
     HandleSweepsAndVolatility();
 
     // 4) Update session high/low
