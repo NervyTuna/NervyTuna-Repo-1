@@ -234,7 +234,21 @@ bool AdjustPricesBySpread()
 {
     double bid = SymbolInfoDouble(Symbol(), SYMBOL_BID);
     double ask = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
-    if(bid <= 0 || ask <= 0) return false;  // Tell caller we failed
+
+    // Retry mechanism for missing prices
+    if (bid <= 0 || ask <= 0)
+    {
+        Print("[AdjustPricesBySpread] Missing bid/ask prices. Retrying...");
+        Sleep(500);  // Wait for 500ms
+        RefreshRates();  // Refresh price data
+        bid = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+        ask = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
+        if (bid <= 0 || ask <= 0)
+        {
+            Print("[AdjustPricesBySpread] Failed to retrieve valid prices.");
+            return false;  // Tell caller we failed
+        }
+    }
 
     double spreadPoints = GetSpreadForTime();
     double adjustedBid = bid - (spreadPoints * Point);
@@ -243,9 +257,9 @@ bool AdjustPricesBySpread()
     adjustedBid = NormalizeDouble(adjustedBid, _Digits);  // Normalize
     adjustedAsk = NormalizeDouble(adjustedAsk, _Digits);  // Normalize
 
-    GlobalVariableSet(globalVarPrefix+"_AdjBid", adjustedBid);
-    GlobalVariableSet(globalVarPrefix+"_AdjAsk", adjustedAsk);
-    GlobalVariableSet(globalVarPrefix+"_Spread", spreadPoints);
+    GlobalVariableSet(globalVarPrefix + "_AdjBid", adjustedBid);
+    GlobalVariableSet(globalVarPrefix + "_AdjAsk", adjustedAsk);
+    GlobalVariableSet(globalVarPrefix + "_Spread", spreadPoints);
 
     return true;
 }
